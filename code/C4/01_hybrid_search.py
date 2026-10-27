@@ -1,13 +1,14 @@
 import json
 import os
 import numpy as np
-from pymilvus import connections, MilvusClient, FieldSchema, CollectionSchema, DataType, Collection, AnnSearchRequest, RRFRanker
+from pymilvus import connections, MilvusClient, FieldSchema, CollectionSchema, DataType, Collection, AnnSearchRequest, RRFRanker, MilvusException
 from pymilvus.model.hybrid import BGEM3EmbeddingFunction
 
 # 1. 初始化设置
 COLLECTION_NAME = "dragon_hybrid_demo"
-MILVUS_URI = "http://localhost:19530"  # 服务器模式
-DATA_PATH = "../../data/C4/metadata/dragon.json"  # 相对路径
+# MILVUS_URI = "http://localhost:19530"  # 服务器模式
+MILVUS_URI = "./milvus_c4.db"  # mulvus 本地模式
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../data/C4/metadata/dragon.json")  # 相对于脚本文件
 BATCH_SIZE = 50
 
 # 2. 连接 Milvus 并初始化嵌入模型
@@ -25,7 +26,8 @@ if milvus_client.has_collection(COLLECTION_NAME):
     milvus_client.drop_collection(COLLECTION_NAME)
 
 fields = [
-    FieldSchema(name="pk", dtype=DataType.VARCHAR, is_primary=True, auto_id=True, max_length=100),
+    # Milvus Lite 要求 auto_id 主键必须是 INT64
+    FieldSchema(name="pk", dtype=DataType.INT64, is_primary=True, auto_id=True),
     FieldSchema(name="img_id", dtype=DataType.VARCHAR, max_length=100),
     FieldSchema(name="path", dtype=DataType.VARCHAR, max_length=256),
     FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=256),
@@ -182,25 +184,43 @@ for i, hit in enumerate(sparse_results):
 
 print("\n--- [混合] 稀疏+密集向量搜索结果 ---")
 # 创建 RRF 融合器
-rerank = RRFRanker(k=60)
+rrf_k = 60
+rerank = RRFRanker(k=rrf_k)
 
 # 创建搜索请求
 dense_req = AnnSearchRequest([dense_vec], "dense_vector", search_params, limit=top_k)
 sparse_req = AnnSearchRequest([sparse_vec], "sparse_vector", search_params, limit=top_k)
 
 # 执行混合搜索
-results = collection.hybrid_search(
-    [sparse_req, dense_req],
-    rerank=rerank,
-    limit=top_k,
-    output_fields=["title", "path", "description", "category", "location", "environment"]
-)[0]
+try:
+    results = collection.hybrid_search(
+        [sparse_req, dense_req],
+        rerank=rerank,
+        limit=top_k,
+        output_fields=["title", "path", "description", "category", "location", "environment"]
+    )[0]
 
-# 打印最终结果
-for i, hit in enumerate(results):
-    print(f"{i+1}. {hit.entity.get('title')} (Score: {hit.distance:.4f})")
-    print(f"    路径: {hit.entity.get('path')}")
-    print(f"    描述: {hit.entity.get('description')[:100]}...")
+    # 打印最终结果
+    for i, hit in enumerate(results):
+        print(f"{i+1}. {hit.entity.get('title')} (Score: {hit.distance:.4f})")
+        print(f"    路径: {hit.entity.get('path')}")
+        print(f"    描述: {hit.entity.get('description')[:100]}...")
+except MilvusException as e:
+    # Milvus Lite 尚不支持服务端 hybrid_search（报 function_score），退回客户端 RRF 融合
+    print(f"服务端 hybrid_search 不可用（{e}），改用客户端 RRF 融合（k={rrf_k}）。")
+
+    scores, entities = {}, {}
+    for branch_results in (sparse_results, dense_results):
+        for rank, hit in enumerate(branch_results, start=1):
+            scores[hit.id] = scores.get(hit.id, 0.0) + 1.0 / (rrf_k + rank)
+            entities.setdefault(hit.id, hit.entity)
+
+    fused = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+    for i, (key, score) in enumerate(fused):
+        entity = entities[key]
+        print(f"{i+1}. {entity.get('title')} (Score: {score:.4f})")
+        print(f"    路径: {entity.get('path')}")
+        print(f"    描述: {entity.get('description')[:100]}...")
 
 # 7. 清理资源
 milvus_client.release_collection(collection_name=COLLECTION_NAME)
